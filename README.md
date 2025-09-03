@@ -141,7 +141,7 @@ SERIAL_PORT = '/dev/ttyUSB0'  # Upravte podle vašeho systému (např. 'COM3' pr
 BAUDRATE = 115200
 # ZDE ZADEJTE VAŠE SÉRIOVÉ ČÍSLO!
 # ENTER YOUR SERIAL NUMBER HERE!
-BMS_BARCODE = 'PPTAP01419B15082' 
+BMS_BARCODE = 'PP' 
 
 # --- PŘÍKAZY (COMMANDS) ---
 CMD_LOGIN = b'login debug\n'
