@@ -75,7 +75,29 @@ def on_connect(client, userdata, flags, rc):
     if rc == 0: print("[MQTT] Successfully connected to broker!"); connection_event.set()
     else: print(f"[MQTT] Connection failed with code: {rc}.")
 
-def publish_ha_discovery(client):
+def get_module_count(ser):
+    """Detects the number of connected battery modules by sending the 'info' command."""
+    print("Sending 'info' command to detect module count...")
+    ser.write(b'info\n')
+    # Use a long timeout as the info command can have a large response
+    response_bytes = ser.read_until(b'pylon_debug>') 
+    response_str = response_bytes.decode('ascii', errors='ignore')
+    
+    module_count = 0
+    for line in response_str.splitlines():
+        # Counts lines starting with 'BMU' which indicates a battery module unit
+        if line.strip().startswith('BMU'):
+            module_count += 1
+            
+    # Fallback to 5 if detection fails, assuming a default setup
+    if module_count == 0:
+        print("Could not detect modules via 'info' command. Defaulting to 5.")
+        return 5
+        
+    print(f"Detected {module_count} battery modules.")
+    return module_count
+
+def publish_ha_discovery(client, module_count):
     print("Publishing MQTT Discovery configuration (in English)...")
     device_info = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
     
@@ -89,7 +111,10 @@ def publish_ha_discovery(client):
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
 
     cell_sensors = {"voltage": {"n": "Voltage", "u": "V", "c": "voltage", "s": "measurement"},"temperature": {"n": "Temperature", "u": "°C", "c": "temperature", "s": "measurement"},"status_1": {"n": "Status 1", "i": "mdi:list-status"},"status_2": {"n": "Status 2", "i": "mdi:list-status"}}
-    for i in range(1, 76):
+    # Calculate total cells based on detected modules (assuming 15 cells per module)
+    total_cells = module_count * 15
+    print(f"Creating HA sensors for {total_cells} cells...")
+    for i in range(1, total_cells + 1):
         for key, val in cell_sensors.items():
             topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_{key}"; config_payload = {"name": f"{DEVICE_NAME} Cell {i} {val['n']}", "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
             if "u" in val: config_payload["unit_of_measurement"] = val["u"]
@@ -108,11 +133,19 @@ try:
     print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}...")
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
-    if not connection_event.wait(timeout=10): raise ConnectionError("Timeout while waiting for MQTT broker connection.")
-    publish_ha_discovery(mqtt_client)
-    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=5)
+    if not connection_event.wait(timeout=10):
+        raise ConnectionError("Timeout while waiting for MQTT broker connection.")
+
+    # Nyní se nejprve připojíme k sériovému portu a zjistíme počet modulů
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=10)
     print(f"Serial port {SERIAL_PORT} opened successfully at {BAUDRATE} baud.")
+    
     connect_and_authorize(ser)
+    
+    num_modules = get_module_count(ser)
+    
+    # A až TEĎ voláme publish_ha_discovery s potřebným argumentem
+    publish_ha_discovery(mqtt_client, num_modules)
     
     print("\n--- Starting regular data reading and publishing to HA ---")
     while True:
