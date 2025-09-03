@@ -19,16 +19,20 @@ HA_DISCOVERY_PREFIX = os.getenv('HA_DISCOVERY_PREFIX', 'homeassistant')
 DEVICE_UNIQUE_ID = os.getenv('DEVICE_UNIQUE_ID', 'pylontech_sc0500')
 DEVICE_NAME = os.getenv('DEVICE_NAME', 'Pylontech BMS SC0500')
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
+
+# --- Check for essential configuration ---
 if not all([BMS_BARCODE, MQTT_BROKER, MQTT_USER, MQTT_PASSWORD]):
-    print("ERROR: One of the key values is missing in the .env file.")
+    print("ERROR: One of the key values (BMS_BARCODE, MQTT_BROKER, MQTT_USER, MQTT_PASSWORD) is missing in the .env file.")
     exit()
 
+# --- BMS Commands ---
 CMD_LOGIN = b'login debug\n'
 CMD_AUTHORIZE = f'tbar {BMS_BARCODE}\n'.encode('ascii')
 CMD_GET_DATA = b'getpwr\n'
 connection_event = threading.Event()
 
 def connect_and_authorize(ser):
+    """Establishes connection with the BMS and authorizes the session."""
     ser.read_all()
     print("Sending login command...")
     if b'pylon_debug>' not in ser.read_until(b'pylon_debug>'):
@@ -41,20 +45,30 @@ def connect_and_authorize(ser):
     print("Authorization successful.")
     time.sleep(0.5)
 
-def safe_int(v, d=0):
-    try: return int(v.strip()) if v.strip() else d
-    except (ValueError, TypeError): return d
+def safe_int(value, default=0):
+    """Safely converts a value to int. Returns default on failure."""
+    try:
+        return int(value.strip()) if value.strip() else default
+    except (ValueError, TypeError):
+        return default
 
-def safe_float(v, d=0.0):
-    try: return float(v.strip()) if v.strip() else d
-    except (ValueError, TypeError): return d
+def safe_float(value, default=0.0):
+    """Safely converts a value to float. Returns default on failure."""
+    try:
+        return float(value.strip()) if value.strip() else default
+    except (ValueError, TypeError):
+        return default
 
-# --- ZMĚNA 1: Rozšíření parsovací funkce ---
 def parse_bms_data(raw_data_str):
+    """Parses the raw text output from the BMS and returns structured data."""
     data_lines = [line.strip() for line in raw_data_str.strip().splitlines() if '#' in line]
-    if len(data_lines) < 3: return None
+    if len(data_lines) < 3:
+        if DEBUG_MODE: print(f"[PARSER] Not enough data lines to parse. Found: {len(data_lines)}")
+        return None
     bms_data = {'summary': {}, 'cells': [], 'footer': {}}
     header_line, cell_lines, footer_lines = data_lines[0], data_lines[1:-2], data_lines[-2:]
+    
+    # OPRAVA: Zpracování všech dat z hlavičky
     header_parts = [p.strip() for p in header_line.split('#')]
     if len(header_parts) >= 8:
         bms_data['summary'] = {
@@ -67,6 +81,8 @@ def parse_bms_data(raw_data_str):
             'current_status': header_parts[6],
             'temperature_status': header_parts[7]
         }
+    
+    # OPRAVA: Zpracování všech dat z článků
     for i, line in enumerate(cell_lines):
         cell_parts = [p.strip() for p in line.split('#')]
         if len(cell_parts) >= 4:
@@ -77,6 +93,7 @@ def parse_bms_data(raw_data_str):
                 'status_1': cell_parts[2],
                 'status_2': cell_parts[3]
             })
+            
     if len(footer_lines) == 2:
         bms_data['footer'] = {
             'error_code': safe_int(footer_lines[0].replace('#', '')),
@@ -85,14 +102,16 @@ def parse_bms_data(raw_data_str):
     return bms_data
 
 def on_connect(client, userdata, flags, rc):
+    """Callback for MQTT connection status."""
     if rc == 0: print("[MQTT] Successfully connected to broker!"); connection_event.set()
     else: print(f"[MQTT] Connection failed with code: {rc}.")
 
-# --- ZMĚNA 2: Rozšíření definice senzorů ---
 def publish_ha_discovery(client):
+    """Publishes configuration data for Home Assistant MQTT Discovery."""
     print("Publishing MQTT Discovery configuration (in English)...")
     device_info = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
     
+    # OPRAVA: Definice pro všechny souhrnné senzory
     summary_sensors = {
         "voltage": {"n": "Total Voltage", "u": "V", "c": "voltage", "s": "measurement"},
         "current": {"n": "Total Current", "u": "A", "c": "current", "s": "measurement"},
@@ -114,6 +133,7 @@ def publish_ha_discovery(client):
         if "i" in val: config_payload["icon"] = val["i"]
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
 
+    # OPRAVA: Definice pro všechny senzory každého článku
     cell_sensors = {
         "voltage": {"n": "Voltage", "u": "V", "c": "voltage", "s": "measurement"},
         "temperature": {"n": "Temperature", "u": "°C", "c": "temperature", "s": "measurement"},
@@ -132,16 +152,16 @@ def publish_ha_discovery(client):
     
     print("Configuration publishing finished.")
 
-# --- ZMĚNA 3: Rozšíření hlavní smyčky pro odesílání ---
+# --- MAIN SCRIPT ---
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 mqtt_client.on_connect = on_connect
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-
 try:
     print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}...")
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
-    if not connection_event.wait(timeout=10): raise ConnectionError("Timeout while waiting for MQTT broker connection.")
+    if not connection_event.wait(timeout=10):
+        raise ConnectionError("Timeout while waiting for MQTT broker connection.")
     publish_ha_discovery(mqtt_client)
     ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=5)
     print(f"Serial port {SERIAL_PORT} opened successfully at {BAUDRATE} baud.")
@@ -156,12 +176,14 @@ try:
         if data and data.get('summary') and data.get('footer') and data.get('cells'):
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Data received, publishing to MQTT.")
             
+            # OPRAVA: Spojení a odeslání VŠECH souhrnných dat a dat z patičky
             all_summary_data = {**data['summary'], **data['footer']}
             for key, value in all_summary_data.items():
                 topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state"
                 mqtt_client.publish(topic, value)
                 if DEBUG_MODE: print(f"  > MQTT | Topic: {topic} | Payload: {value}")
 
+            # OPRAVA: Odeslání VŠECH dat z článků
             for cell in data['cells']:
                 for key, value in cell.items():
                     if key == 'id': continue
@@ -175,7 +197,10 @@ try:
 except Exception as e:
     print(f"A critical error occurred: {e}")
 finally:
-    if 'ser' in locals() and ser.is_open: ser.close(); print("Serial port closed.")
+    if 'ser' in locals() and ser.is_open:
+        ser.close()
+        print("Serial port closed.")
     if mqtt_client.is_connected():
-        mqtt_client.loop_stop(); mqtt_client.disconnect()
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
         print("MQTT connection closed.")
