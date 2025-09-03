@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
 import threading
 
-# --- Načtení konfigurace (zůstává stejné) ---
+# --- Načtení konfigurace ---
 load_dotenv()
 SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
 BAUDRATE = int(os.getenv('BAUDRATE', 115200)) 
@@ -18,17 +18,17 @@ MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
 HA_DISCOVERY_PREFIX = os.getenv('HA_DISCOVERY_PREFIX', 'homeassistant')
 DEVICE_UNIQUE_ID = os.getenv('DEVICE_UNIQUE_ID', 'pylontech_sc0500')
 DEVICE_NAME = os.getenv('DEVICE_NAME', 'Pylontech BMS SC0500')
+# Načtení debugovacího režimu
+DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
 
+# ... (Všechny funkce a definice zůstávají stejné) ...
 if not all([BMS_BARCODE, MQTT_BROKER, MQTT_USER, MQTT_PASSWORD]):
     print("CHYBA: V souboru .env chybí jedna z klíčových hodnot.")
     exit()
-
-# --- Definice (zůstává stejné) ---
 CMD_LOGIN = b'login debug\n'
 CMD_AUTHORIZE = f'tbar {BMS_BARCODE}\n'.encode('ascii')
 CMD_GET_DATA = b'getpwr\n'
 connection_event = threading.Event()
-
 def connect_and_authorize(ser):
     ser.read_all(); print("Posílám příkaz pro login..."); ser.write(CMD_LOGIN)
     if b'pylon_debug>' not in ser.read_until(b'pylon_debug>'): raise ConnectionError("Login se nezdařil.")
@@ -36,45 +36,29 @@ def connect_and_authorize(ser):
     print(f"Posílám autorizaci s SN: {BMS_BARCODE}..."); ser.write(CMD_AUTHORIZE)
     if b"pass" not in ser.read_until(b'pylon_debug>'): raise ConnectionError("Autorizace selhala!")
     print("Autorizace úspěšná."); time.sleep(0.5)
-
 def safe_int(v, d=0):
     try: return int(v.strip()) if v.strip() else d
     except (ValueError, TypeError): return d
-
 def safe_float(v, d=0.0):
     try: return float(v.strip()) if v.strip() else d
     except (ValueError, TypeError): return d
-
-# --- OPRAVENÁ PARSOVACÍ FUNKCE ---
 def parse_bms_data(raw_data_str):
-    """Zpracuje surový textový výstup z BMS a vrátí strukturovaná data."""
-    # Zpracujeme pouze řádky, které obsahují data (mají v sobě '#')
     data_lines = [line.strip() for line in raw_data_str.strip().splitlines() if '#' in line]
-    
-    if len(data_lines) < 3: # Potřebujeme hlavičku, alespoň jeden článek a patičku
-        print(f"[PARSER] Nedostatek datových řádků k parsování. Nalezeno: {len(data_lines)}")
+    if len(data_lines) < 3:
+        if DEBUG_MODE: print(f"[PARSER] Nedostatek datových řádků k parsování. Nalezeno: {len(data_lines)}")
         return None
-
     bms_data = {'summary': {}, 'cells': [], 'footer': {}}
-    
-    # První datový řádek je hlavička, poslední dva jsou patička
     header_line, cell_lines, footer_lines = data_lines[0], data_lines[1:-2], data_lines[-2:]
-    
     header_parts = [p.strip() for p in header_line.split('#')]
     if len(header_parts) >= 8:
         bms_data['summary'] = {'voltage': safe_float(header_parts[0])/1000.0, 'current': safe_float(header_parts[1])/1000.0, 'status': header_parts[4]}
-    
     for i, line in enumerate(cell_lines):
         cell_parts = [p.strip() for p in line.split('#')]
         if len(cell_parts) >= 2:
             bms_data['cells'].append({'id': i+1, 'voltage': safe_float(cell_parts[0])/1000.0})
-            
     if len(footer_lines) == 2:
         bms_data['footer'] = {'error_code': safe_int(footer_lines[0].replace('#','')), 'cycle_count': safe_int(footer_lines[1].replace('#',''))}
-        
     return bms_data
-
-# ... (Funkce publish_ha_discovery zůstává stejná) ...
 def publish_ha_discovery(c):
     print("Publikuji MQTT Discovery konfiguraci..."); d = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
     s = {"voltage": {"n": "Celkové napětí", "u": "V", "c": "voltage"}, "current": {"n": "Celkový proud", "u": "A", "c": "current"}, "status": {"n": "Stav", "i": "mdi:information-outline"}, "cycle_count": {"n": "Počet cyklů", "i": "mdi:battery-sync", "s": "total_increasing"}, "error_code": {"n": "Chybový kód", "i": "mdi:alert-circle-outline"}}
@@ -89,7 +73,6 @@ def publish_ha_discovery(c):
         ts = f"{DEVICE_UNIQUE_ID}_cell_{i}_voltage"; p = {"name": f"{DEVICE_NAME} Článek {i} napětí", "unique_id": ts, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{ts}/state", "unit_of_measurement": "V", "device_class": "voltage", "state_class": "measurement", "device": d}
         c.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{ts}/config", json.dumps(p), retain=True)
     print("Publikace konfigurace dokončena.")
-
 def on_connect(client, userdata, flags, rc):
     if rc == 0: print("[MQTT] Úspěšně připojeno k brokeru!"); connection_event.set()
     else: print(f"[MQTT] Připojení selhalo, kód chyby: {rc}.")
@@ -123,11 +106,21 @@ try:
             
             # Publikace dat
             for key, value in data['summary'].items():
-                mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state", value)
+                topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state"
+                mqtt_client.publish(topic, value)
+                if DEBUG_MODE: print(f"  > MQTT | Téma: {topic} | Data: {value}")
+                
             for key, value in data['footer'].items():
-                mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state", value)
+                topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state"
+                mqtt_client.publish(topic, value)
+                if DEBUG_MODE: print(f"  > MQTT | Téma: {topic} | Data: {value}")
+
             for cell in data['cells']:
-                mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_cell_{cell['id']}_voltage/state", cell['voltage'])
+                topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_cell_{cell['id']}_voltage/state"
+                mqtt_client.publish(topic, cell['voltage'])
+                # Výpis pro články jen pokud je DEBUG zapnutý, aby nezahlcoval log
+                if DEBUG_MODE: print(f"  > MQTT | Téma: {topic} | Data: {cell['voltage']}")
+
         else:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Čekám na kompletní data...")
 
