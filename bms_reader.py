@@ -101,22 +101,53 @@ def publish_ha_discovery(client, module_count):
     print("Publishing MQTT Discovery configuration (in English)...")
     device_info = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
     
-    summary_sensors = {"voltage": {"n": "Total Voltage", "u": "V", "c": "voltage", "s": "measurement"},"current": {"n": "Total Current", "u": "A", "c": "current", "s": "measurement"},"avg_temperature": {"n": "Average Temperature", "u": "°C", "c": "temperature", "s": "measurement"},"capacity": {"n": "Capacity", "u": "Wh", "c": "energy", "s": "measurement"},"status": {"n": "Status", "i": "mdi:information-outline"},"voltage_status": {"n": "Voltage Status", "i": "mdi:lightning-bolt"},"current_status": {"n": "Current Status", "i": "mdi:current-ac"},"temperature_status": {"n": "Temperature Status", "i": "mdi:thermometer"},"cycle_count": {"n": "Cycle Count", "i": "mdi:battery-sync", "s": "total_increasing"},"error_code": {"n": "Error Code", "i": "mdi:alert-circle-outline"}}
+    summary_sensors = {
+        "voltage": {"n": "Total Voltage", "u": "V", "c": "voltage", "s": "measurement"},
+        "current": {"n": "Total Current", "u": "A", "c": "current", "s": "measurement"},
+        "avg_temperature": {"n": "Average Temperature", "u": "°C", "c": "temperature", "s": "measurement"},
+        "capacity": {"n": "Capacity", "u": "Wh", "c": "energy", "s": "measurement"},
+        "status": {"n": "Status", "i": "mdi:information-outline"},
+        "voltage_status": {"n": "Voltage Status", "i": "mdi:lightning-bolt"},
+        "current_status": {"n": "Current Status", "i": "mdi:current-ac"},
+        "temperature_status": {"n": "Temperature Status", "i": "mdi:thermometer"},
+        "cycle_count": {"n": "Cycle Count", "i": "mdi:battery-sync", "s": "total_increasing"},
+        "error_code": {"n": "Error Code", "i": "mdi:alert-circle-outline"}
+    }
     for key, val in summary_sensors.items():
-        topic_slug = f"{DEVICE_UNIQUE_ID}_{key}"; config_payload = {"name": f"{DEVICE_NAME} {val['n']}", "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+        topic_slug = f"{DEVICE_UNIQUE_ID}_{key}"
+        # --- OPRAVA ZDE ---
+        # Název senzoru už neobsahuje název zařízení.
+        config_payload = {
+            "name": val['n'], # PŮVODNĚ BYLO: f"{DEVICE_NAME} {val['n']}"
+            "unique_id": topic_slug,
+            "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state",
+            "device": device_info
+        }
         if "u" in val: config_payload["unit_of_measurement"] = val["u"]
         if "c" in val: config_payload["device_class"] = val["c"]
         if "s" in val: config_payload["state_class"] = val["s"]
         if "i" in val: config_payload["icon"] = val["i"]
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
 
-    cell_sensors = {"voltage": {"n": "Voltage", "u": "V", "c": "voltage", "s": "measurement"},"temperature": {"n": "Temperature", "u": "°C", "c": "temperature", "s": "measurement"},"status_1": {"n": "Status 1", "i": "mdi:list-status"},"status_2": {"n": "Status 2", "i": "mdi:list-status"}}
-    # Calculate total cells based on detected modules (assuming 15 cells per module)
+    cell_sensors = {
+        "voltage": {"n": "Voltage", "u": "V", "c": "voltage", "s": "measurement"},
+        "temperature": {"n": "Temperature", "u": "°C", "c": "temperature", "s": "measurement"},
+        "status_1": {"n": "Status 1", "i": "mdi:list-status"},
+        "status_2": {"n": "Status 2", "i": "mdi:list-status"}
+    }
+    
     total_cells = module_count * 15
     print(f"Creating HA sensors for {total_cells} cells...")
     for i in range(1, total_cells + 1):
         for key, val in cell_sensors.items():
-            topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_{key}"; config_payload = {"name": f"{DEVICE_NAME} Cell {i} {val['n']}", "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+            topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_{key}"
+            # --- OPRAVA ZDE ---
+            config_payload = {
+                "name": f"Cell {i} {val['n']}", # PŮVODNĚ BYLO: f"{DEVICE_NAME} Cell {i} {val['n']}"
+                "unique_id": topic_slug,
+                "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state",
+                "device": device_info
+            }
             if "u" in val: config_payload["unit_of_measurement"] = val["u"]
             if "c" in val: config_payload["device_class"] = val["c"]
             if "s" in val: config_payload["state_class"] = val["s"]
