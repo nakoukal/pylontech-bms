@@ -97,6 +97,15 @@ def parse_bms_data(raw_data_str):
         
     return bms_data
 
+def on_connect(client, userdata, flags, rc):
+    """Callback for MQTT connection status."""
+    if rc == 0:
+        print("[MQTT] Successfully connected to broker!")
+        connection_event.set()
+    else:
+        print(f"[MQTT] Connection failed with code: {rc}. Check credentials and broker settings.")
+
+# --- OPRAVENÁ FUNKCE S ANGLICKÝMI NÁZVY ---
 def publish_ha_discovery(client):
     """Publishes configuration data for Home Assistant MQTT Discovery."""
     print("Publishing MQTT Discovery configuration (in English)...")
@@ -110,6 +119,7 @@ def publish_ha_discovery(client):
         "error_code": {"n": "Error Code", "i": "mdi:alert-circle-outline"},
     }
 
+    # Konfigurace pro souhrnné senzory
     for key, val in sensors.items():
         topic_slug = f"{DEVICE_UNIQUE_ID}_{key}"
         config_payload = {
@@ -122,9 +132,10 @@ def publish_ha_discovery(client):
         if "c" in val: config_payload["device_class"] = val["c"]
         if "s" in val: config_payload["state_class"] = val["s"]
         if "i" in val: config_payload["icon"] = val["i"]
-        # OPRAVA: Použita správná proměnná 'topic_slug'
+        # OPRAVA: Použity správné proměnné 'topic_slug' a 'config_payload'
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
 
+    # Konfigurace pro napětí jednotlivých článků
     for i in range(1, 76):
         topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_voltage"
         config_payload = {
@@ -139,14 +150,6 @@ def publish_ha_discovery(client):
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
     
     print("Configuration publishing finished.")
-
-def on_connect(client, userdata, flags, rc):
-    """Callback for MQTT connection status."""
-    if rc == 0:
-        print("[MQTT] Successfully connected to broker!")
-        connection_event.set()
-    else:
-        print(f"[MQTT] Connection failed with code: {rc}. Check credentials and broker settings.")
 
 # --- MAIN SCRIPT ---
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
@@ -179,20 +182,17 @@ try:
             for key, value in data['summary'].items():
                 topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state"
                 mqtt_client.publish(topic, value)
-                if DEBUG_MODE:
-                    print(f"  > MQTT | Topic: {topic} | Payload: {value}")
+                if DEBUG_MODE: print(f"  > MQTT | Topic: {topic} | Payload: {value}")
                 
             for key, value in data['footer'].items():
                 topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state"
                 mqtt_client.publish(topic, value)
-                if DEBUG_MODE:
-                    print(f"  > MQTT | Topic: {topic} | Payload: {value}")
+                if DEBUG_MODE: print(f"  > MQTT | Topic: {topic} | Payload: {value}")
 
             for cell in data['cells']:
                 topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_cell_{cell['id']}_voltage/state"
                 mqtt_client.publish(topic, cell['voltage'])
-                if DEBUG_MODE:
-                    print(f"  > MQTT | Topic: {topic} | Payload: {cell['voltage']}")
+                if DEBUG_MODE: print(f"  > MQTT | Topic: {topic} | Payload: {cell['voltage']}")
         else:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Waiting for complete data...")
 
