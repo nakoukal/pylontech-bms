@@ -10,6 +10,7 @@ load_dotenv()
 
 # --- NAČTENÍ KONFIGURACE Z .env ---
 SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
+BAUDRATE = int(os.getenv('BAUDRATE', 115200)) # <--- OPRAVA: Načtení baudrate
 BMS_BARCODE = os.getenv('BMS_BARCODE')
 
 MQTT_BROKER = os.getenv('MQTT_BROKER')
@@ -136,7 +137,8 @@ def publish_ha_discovery(client):
     print("Publikace konfigurace dokončena.")
 
 # --- HLAVNÍ KÓD ---
-mqtt_client = mqtt.Client()
+# OPRAVA: Přidán parametr pro odstranění DeprecationWarning
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
 try:
@@ -146,8 +148,9 @@ try:
 
     publish_ha_discovery(mqtt_client)
 
+    # Hodnota BAUDRATE je nyní správně načtena z .env souboru
     ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=5)
-    print(f"Port {SERIAL_PORT} úspěšně otevřen.")
+    print(f"Port {SERIAL_PORT} úspěšně otevřen s rychlostí {BAUDRATE}.")
     
     connect_and_authorize(ser)
     
@@ -161,7 +164,7 @@ try:
         
         if '#' in clean_output:
             data = parse_bms_data(clean_output)
-            if data:
+            if data and data['summary'] and data['footer'] and data['cells']:
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Data přijata, odesílám na MQTT.")
                 
                 # Publikace souhrnných dat
@@ -183,9 +186,10 @@ try:
 except Exception as e:
     print(f"Došlo k závažné chybě: {e}")
 finally:
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
-    print("MQTT spojení uzavřeno.")
+    if mqtt_client.is_connected():
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+        print("MQTT spojení uzavřeno.")
     if 'ser' in locals() and ser.is_open:
         ser.close()
         print("Sériový port uzavřen.")
