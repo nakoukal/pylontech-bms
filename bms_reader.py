@@ -75,32 +75,52 @@ def on_connect(client, userdata, flags, rc):
     if rc == 0: print("[MQTT] Successfully connected to broker!"); connection_event.set()
     else: print(f"[MQTT] Connection failed with code: {rc}.")
 
-def get_module_count(ser):
-    """Detects the number of connected battery modules by sending the 'info' command."""
-    print("Sending 'info' command to detect module count...")
+# --- VLOŽTE MÍSTO PŮVODNÍ get_module_count ---
+def get_module_info(ser):
+    """
+    Detects connected battery modules and their barcodes by sending the 'info' command.
+    Returns a dictionary mapping module barcodes to their index (e.g., {'P22...': 0, 'PPT...': 1}).
+    """
+    print("Sending 'info' command to detect module barcodes...")
     ser.write(b'info\n')
-    # Use a long timeout as the info command can have a large response
-    response_bytes = ser.read_until(b'pylon_debug>') 
+    response_bytes = ser.read_until(b'pylon_debug>', timeout=15) # Delší timeout pro 'info'
     response_str = response_bytes.decode('ascii', errors='ignore')
     
-    module_count = 0
+    modules = {}
+    current_bmu_index = -1
+    
     for line in response_str.splitlines():
-        # Counts lines starting with 'BMU' which indicates a battery module unit
-        if line.strip().startswith('BMU'):
-            module_count += 1
-            
-    # Fallback to 5 if detection fails, assuming a default setup
-    if module_count == 0:
-        print("Could not detect modules via 'info' command. Defaulting to 5.")
-        return 5
+        line = line.strip()
+        if line.startswith('BMU'):
+            # Našli jsme nový BMU blok, získáme jeho index
+            try:
+                current_bmu_index = int(line.split()[1])
+            except (ValueError, IndexError):
+                current_bmu_index = -1 # Reset v případě chyby
         
-    print(f"Detected {module_count} battery modules.")
-    return module_count
+        # Hledáme řádek s čárovým kódem modulu uvnitř BMU bloku
+        if line.startswith('Module:') and current_bmu_index != -1:
+            try:
+                # Očistíme barcode od 'Module:' a mezer
+                barcode = line.split(':', 1)[1].strip()
+                if barcode:
+                    modules[barcode] = current_bmu_index
+                    print(f"  > Detected Module Index {current_bmu_index} with Barcode: {barcode}")
+            except IndexError:
+                continue # Přeskočíme řádek, pokud nemá očekávaný formát
 
-def publish_ha_discovery(client, module_count):
+    if not modules:
+        print("Could not detect any modules via 'info' command. Cannot proceed.")
+        return None
+        
+    print(f"Detected {len(modules)} battery modules in total.")
+    return modules
+
+def publish_ha_discovery(client, modules_info):
     print("Publishing MQTT Discovery configuration (in English)...")
     device_info = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
     
+    # ... (část pro summary_sensors zůstává stejná) ...
     summary_sensors = {
         "voltage": {"n": "Total Voltage", "u": "V", "c": "voltage", "s": "measurement"},
         "current": {"n": "Total Current", "u": "A", "c": "current", "s": "measurement"},
@@ -111,48 +131,50 @@ def publish_ha_discovery(client, module_count):
         "current_status": {"n": "Current Status", "i": "mdi:current-ac"},
         "temperature_status": {"n": "Temperature Status", "i": "mdi:thermometer"},
         "cycle_count": {"n": "Cycle Count", "i": "mdi:battery-sync", "s": "total_increasing"},
-        "error_code": {"n": "Error Code", "i": "mdi:alert-circle-outline"}
+        "error_code": {"n": "Error Code", "i": "mdi:alert-circle-outline"},
+        # Nový senzor pro počet modulů
+        "module_count": {"n": "Module Count", "i": "mdi:battery"},
     }
     for key, val in summary_sensors.items():
-        topic_slug = f"{DEVICE_UNIQUE_ID}_{key}"
-        # --- OPRAVA ZDE ---
-        # Název senzoru už neobsahuje název zařízení.
-        config_payload = {
-            "name": val['n'], # PŮVODNĚ BYLO: f"{DEVICE_NAME} {val['n']}"
-            "unique_id": topic_slug,
-            "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state",
-            "device": device_info
-        }
-        if "u" in val: config_payload["unit_of_measurement"] = val["u"]
-        if "c" in val: config_payload["device_class"] = val["c"]
-        if "s" in val: config_payload["state_class"] = val["s"]
-        if "i" in val: config_payload["icon"] = val["i"]
+        topic_slug = f"{DEVICE_UNIQUE_ID}_{key}"; config_payload = {"name": val['n'], "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+        if "u" in val: config_payload["unit_of_measurement"] = val["u"];
+        if "c" in val: config_payload["device_class"] = val["c"];
+        if "s" in val: config_payload["state_class"] = val["s"];
+        if "i" in val: config_payload["icon"] = val["i"];
         client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
 
     cell_sensors = {
         "voltage": {"n": "Voltage", "u": "V", "c": "voltage", "s": "measurement"},
         "temperature": {"n": "Temperature", "u": "°C", "c": "temperature", "s": "measurement"},
         "status_1": {"n": "Status 1", "i": "mdi:list-status"},
-        "status_2": {"n": "Status 2", "i": "mdi:list-status"}
+        "status_2": {"n": "Status 2", "i": "mdi:list-status"},
     }
     
-    total_cells = module_count * 15
-    print(f"Creating HA sensors for {total_cells} cells...")
-    for i in range(1, total_cells + 1):
-        for key, val in cell_sensors.items():
-            topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_{key}"
-            # --- OPRAVA ZDE ---
-            config_payload = {
-                "name": f"Cell {i} {val['n']}", # PŮVODNĚ BYLO: f"{DEVICE_NAME} Cell {i} {val['n']}"
-                "unique_id": topic_slug,
-                "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state",
-                "device": device_info
-            }
-            if "u" in val: config_payload["unit_of_measurement"] = val["u"]
-            if "c" in val: config_payload["device_class"] = val["c"]
-            if "s" in val: config_payload["state_class"] = val["s"]
-            if "i" in val: config_payload["icon"] = val["i"]
-            client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
+    CELLS_PER_MODULE = 15
+    module_count = len(modules_info)
+    total_cells = module_count * CELLS_PER_MODULE
+    print(f"Creating HA sensors for {total_cells} cells across {module_count} modules...")
+    
+    # Seřadíme moduly podle jejich indexu pro konzistentní pojmenování
+    sorted_modules = sorted(modules_info.items(), key=lambda item: item[1])
+    
+    for module_index, (barcode, bmu_index) in enumerate(sorted_modules, 1):
+        for cell_in_module_num in range(1, CELLS_PER_MODULE + 1):
+            # Celkový index článku (pro parsování)
+            cell_global_index = (bmu_index * CELLS_PER_MODULE) + cell_in_module_num
+            
+            for key, val in cell_sensors.items():
+                # Použijeme poslední 4 znaky barcode pro krátké a unikátní ID
+                short_barcode = barcode[-4:]
+                topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{cell_global_index}_{key}"
+                entity_name = f"M{module_index} ({short_barcode}) C{cell_in_module_num} {val['n']}"
+                
+                config_payload = {"name": entity_name, "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+                if "u" in val: config_payload["unit_of_measurement"] = val["u"]
+                if "c" in val: config_payload["device_class"] = val["c"]
+                if "s" in val: config_payload["state_class"] = val["s"]
+                if "i" in val: config_payload["icon"] = val["i"]
+                client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
     
     print("Configuration publishing finished.")
 
@@ -161,25 +183,29 @@ mqtt_client.on_connect = on_connect
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
 try:
+    # ... (připojení k MQTT zůstává stejné) ...
     print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}...")
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
     mqtt_client.loop_start()
-    if not connection_event.wait(timeout=10):
-        raise ConnectionError("Timeout while waiting for MQTT broker connection.")
-
-    # Nyní se nejprve připojíme k sériovému portu a zjistíme počet modulů
+    if not connection_event.wait(timeout=10): raise ConnectionError("Timeout while waiting for MQTT broker connection.")
+    
     ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=10)
     print(f"Serial port {SERIAL_PORT} opened successfully at {BAUDRATE} baud.")
     
     connect_and_authorize(ser)
     
-    num_modules = get_module_count(ser)
-    
-    # A až TEĎ voláme publish_ha_discovery s potřebným argumentem
-    publish_ha_discovery(mqtt_client, num_modules)
-    
+    # Získáme informace o modulech
+    module_info = get_module_info(ser)
+    if module_info is None:
+        raise SystemExit("Exiting due to module detection failure.")
+
+    # Odešleme konfiguraci a nový senzor s počtem modulů
+    publish_ha_discovery(mqtt_client, module_info)
+    mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_module_count/state", len(module_info))
+
     print("\n--- Starting regular data reading and publishing to HA ---")
     while True:
+        # ... (smyčka pro čtení a odesílání dat zůstává stejná) ...
         ser.write(CMD_GET_DATA)
         response_bytes = ser.read_until(b'pylon_debug>')
         raw_output = response_bytes.decode('ascii', errors='ignore')
@@ -195,6 +221,7 @@ try:
             for cell in data['cells']:
                 for key, value in cell.items():
                     if key == 'id': continue
+                    # Používáme globální index článku pro správné téma
                     topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_cell_{cell['id']}_{key}/state"
                     mqtt_client.publish(topic, value)
                     if DEBUG_MODE and key == 'voltage': print(f"  > MQTT | Publishing Cell {cell['id']} data...")
