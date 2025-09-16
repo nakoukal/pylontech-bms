@@ -78,15 +78,14 @@ def on_connect(client, userdata, flags, rc):
 def get_module_info(ser):
     """
     Detects connected battery modules and their barcodes by sending the 'info' command.
-    Returns a dictionary mapping module barcodes to their index (e.g., {'P22...': 0, 'PPT...': 1}).
+    Returns a dictionary mapping a logical index to a barcode (e.g., {0: 'P22...', 1: 'PPT...'}).
     """
     print("Sending 'info' command to detect module barcodes...")
     ser.write(b'info\n')
-    # The main timeout is already set when opening the serial port
-    response_bytes = ser.read_until(b'pylon_debug>') 
+    response_bytes = ser.read_until(b'pylon_debug>')
     response_str = response_bytes.decode('ascii', errors='ignore')
     
-    modules = {}
+    modules_map = {}
     current_bmu_index = -1
     
     for line in response_str.splitlines():
@@ -99,21 +98,22 @@ def get_module_info(ser):
         
         if line.startswith('Module:') and current_bmu_index != -1:
             try:
-                barcode = line.split(':', 1)[1].strip()
+                # Oprava parsování, aby se odstranila i úvodní dvojtečka
+                barcode = line.split(':', 1)[1].strip().replace(':', '').strip()
                 if barcode:
-                    modules[barcode] = current_bmu_index
-                    print(f"  > Detected Module Index {current_bmu_index} with Barcode: {barcode}")
+                    modules_map[current_bmu_index] = barcode
+                    print(f"  > Found mapping: Logical Index {current_bmu_index} -> Barcode: {barcode}")
             except IndexError:
                 continue
 
-    if not modules:
+    if not modules_map:
         print("Could not detect any modules via 'info' command. Cannot proceed.")
         return None
         
-    print(f"Detected {len(modules)} battery modules in total.")
-    return modules
+    print(f"Detected {len(modules_map)} battery modules in total.")
+    return modules_map
 
-def publish_ha_discovery(client, modules_info):
+def publish_ha_discovery(client, modules_map, actual_module_count):
     print("Publishing MQTT Discovery configuration (in English)...")
     device_info = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
     
@@ -147,23 +147,26 @@ def publish_ha_discovery(client, modules_info):
     }
     
     CELLS_PER_MODULE = 15
-    print(f"Creating HA sensors for {len(modules_info) * CELLS_PER_MODULE} cells across {len(modules_info)} modules...")
+    total_cells = actual_module_count * CELLS_PER_MODULE
+    print(f"Creating HA sensors for {total_cells} cells across {actual_module_count} active modules...")
     
-    sorted_modules = sorted(modules_info.items(), key=lambda item: item[1])
-    
-    for module_display_index, (barcode, bmu_index) in enumerate(sorted_modules, 1):
-        for cell_in_module_num in range(1, CELLS_PER_MODULE + 1):
-            cell_global_index = (bmu_index * CELLS_PER_MODULE) + cell_in_module_num
-            for key, val in cell_sensors.items():
-                short_barcode = barcode[-4:]
-                topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{cell_global_index}_{key}"
-                entity_name = f"M{module_display_index} ({short_barcode}) C{cell_in_module_num} {val['n']}"
-                config_payload = {"name": entity_name, "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
-                if "u" in val: config_payload["unit_of_measurement"] = val["u"]
-                if "c" in val: config_payload["device_class"] = val["c"]
-                if "s" in val: config_payload["state_class"] = val["s"]
-                if "i" in val: config_payload["icon"] = val["i"]
-                client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
+    for i in range(1, total_cells + 1):
+        logical_module_index = (i - 1) // CELLS_PER_MODULE
+        cell_in_module_num = ((i - 1) % CELLS_PER_MODULE) + 1
+        
+        # Získáme S/N z mapy. Pokud neexistuje, použijeme záložní název.
+        barcode = modules_map.get(logical_module_index, f"Unknown_BMU_{logical_module_index}")
+        short_barcode = barcode[-4:]
+
+        for key, val in cell_sensors.items():
+            topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_{key}"
+            entity_name = f"M{logical_module_index + 1} ({short_barcode}) C{cell_in_module_num} {val['n']}"
+            config_payload = {"name": entity_name, "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+            if "u" in val: config_payload["unit_of_measurement"] = val["u"]
+            if "c" in val: config_payload["device_class"] = val["c"]
+            if "s" in val: config_payload["state_class"] = val["s"]
+            if "i" in val: config_payload["icon"] = val["i"]
+            client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
     
     print("Configuration publishing finished.")
 
@@ -178,18 +181,34 @@ try:
     if not connection_event.wait(timeout=10):
         raise ConnectionError("Timeout while waiting for MQTT broker connection.")
 
-    # Nastavíme delší timeout pro sériový port, aby 'info' mělo dost času
     ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=15)
     print(f"Serial port {SERIAL_PORT} opened successfully at {BAUDRATE} baud.")
     
+    print("Waiting 2 seconds for BMS to initialize...")
+    time.sleep(2)
+    
     connect_and_authorize(ser)
     
-    module_info = get_module_info(ser)
-    if module_info is None:
-        raise SystemExit("Exiting due to module detection failure.")
+    module_info_map = get_module_info(ser)
+    if not module_info_map:
+        raise SystemExit("Exiting due to module info detection failure.")
+    
+    print("\n--- Performing initial data read to determine active module count ---")
+    ser.write(CMD_GET_DATA)
+    response_bytes = ser.read_until(b'pylon_debug>')
+    raw_output = response_bytes.decode('ascii', errors='ignore')
+    initial_data = parse_bms_data(raw_output)
+    
+    if not initial_data or not initial_data.get('cells'):
+        raise SystemExit("Failed to parse initial data, no cells found.")
+    
+    CELLS_PER_MODULE = 15
+    cell_count = len(initial_data['cells'])
+    actual_module_count = cell_count // CELLS_PER_MODULE
+    print(f"Detected {cell_count} active cells, which corresponds to {actual_module_count} modules.")
 
-    publish_ha_discovery(mqtt_client, module_info)
-    mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_module_count/state", len(module_info))
+    publish_ha_discovery(mqtt_client, module_info_map, actual_module_count)
+    mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_module_count/state", actual_module_count)
     
     print("\n--- Starting regular data reading and publishing to HA ---")
     while True:
