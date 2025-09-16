@@ -1,105 +1,148 @@
 import serial
 import time
+import json
 import os
 from dotenv import load_dotenv
+import paho.mqtt.client as mqtt
+import threading
 
-# --- Load configuration from .env file ---
+# --- Načtení konfigurace ---
 load_dotenv()
-SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0')
-BAUDRATE = int(os.getenv('BAUDRATE', 115200)) 
-BMS_BARCODE = os.getenv('BMS_BARCODE')
+SERIAL_PORT = os.getenv('SERIAL_PORT', '/dev/ttyUSB0'); BAUDRATE = int(os.getenv('BAUDRATE', 115200)); BMS_BARCODE = os.getenv('BMS_BARCODE')
+MQTT_BROKER = os.getenv('MQTT_BROKER'); MQTT_PORT = int(os.getenv('MQTT_PORT', 1883)); MQTT_USER = os.getenv('MQTT_USER'); MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
+HA_DISCOVERY_PREFIX = os.getenv('HA_DISCOVERY_PREFIX', 'homeassistant'); DEVICE_UNIQUE_ID = os.getenv('DEVICE_UNIQUE_ID', 'pylontech_sc0500'); DEVICE_NAME = os.getenv('DEVICE_NAME', 'Pylontech BMS SC0500')
+DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
+if not all([BMS_BARCODE, MQTT_BROKER, MQTT_USER, MQTT_PASSWORD]): print("ERROR: One of the key values is missing in the .env file."); exit()
 
-# --- BMS Commands ---
-CMD_LOGIN = b'login debug\n'
-CMD_AUTHORIZE = f'tbar {BMS_BARCODE}\n'.encode('ascii')
-CMD_GET_DATA = b'getpwr\n'
-CMD_GET_INFO = b'info\n'
+CMD_LOGIN = b'login debug\n'; CMD_AUTHORIZE = f'tbar {BMS_BARCODE}\n'.encode('ascii'); CMD_GET_DATA = b'getpwr\n'
+connection_event = threading.Event()
 
 def connect_and_authorize(ser):
-    """Establishes connection with the BMS and authorizes the session."""
-    ser.read_all()
-    print("Sending login command...")
-    ser.write(CMD_LOGIN)
-    if b'pylon_debug>' not in ser.read_until(b'pylon_debug>'):
-        raise ConnectionError("Login failed.")
-    print("Login successful.")
-    time.sleep(0.5)
-    
-    print(f"Sending authorization with SN: {BMS_BARCODE}...")
-    ser.write(CMD_AUTHORIZE)
-    if b"pass" not in ser.read_until(b'pylon_debug>'):
-        raise ConnectionError("Authorization failed!")
-    print("Authorization successful.")
-    time.sleep(0.5)
+    ser.read_all(); print("Sending login command...")
+    if b'pylon_debug>' not in ser.read_until(b'pylon_debug>'): raise ConnectionError("Login failed.")
+    print("Login successful."); time.sleep(0.5)
+    print(f"Sending authorization with SN: {BMS_BARCODE}..."); ser.write(CMD_AUTHORIZE)
+    if b"pass" not in ser.read_until(b'pylon_debug>'): raise ConnectionError("Authorization failed!")
+    print("Authorization successful."); time.sleep(0.5)
 
-def get_and_print_module_info(ser):
-    """Gets and prints the mapping of logical index to serial number."""
-    print("\n--- Reading Module Info (command: info) ---")
-    ser.write(CMD_GET_INFO)
-    response_bytes = ser.read_until(b'pylon_debug>')
+def safe_int(v, d=0):
+    try: return int(v.strip()) if v.strip() else d
+    except (ValueError, TypeError): return d
+
+def safe_float(v, d=0.0):
+    try: return float(v.strip()) if v.strip() else d
+    except (ValueError, TypeError): return d
+
+def parse_bms_data(raw_data_str):
+    data_lines = [line.strip() for line in raw_data_str.strip().splitlines() if '#' in line]
+    if len(data_lines) < 3: return None
+    bms_data = {'summary': {}, 'cells': [], 'footer': {}}
+    header_line, cell_lines, footer_lines = data_lines[0], data_lines[1:-2], data_lines[-2:]
+    header_parts = [p.strip() for p in header_line.split('#')];
+    if len(header_parts) >= 8: bms_data['summary'] = {'voltage': safe_float(header_parts[0])/1000.0, 'current': safe_float(header_parts[1])/1000.0, 'avg_temperature': safe_int(header_parts[2])/1000.0, 'capacity': safe_int(header_parts[3]), 'status': header_parts[4], 'voltage_status': header_parts[5], 'current_status': header_parts[6], 'temperature_status': header_parts[7]}
+    for i, line in enumerate(cell_lines):
+        cell_parts = [p.strip() for p in line.split('#')]
+        if len(cell_parts) >= 4: bms_data['cells'].append({'id': i + 1, 'voltage': safe_float(cell_parts[0])/1000.0, 'temperature': safe_int(cell_parts[1])/1000.0, 'status_1': cell_parts[2], 'status_2': cell_parts[3]})
+    if len(footer_lines) == 2: bms_data['footer'] = {'error_code': safe_int(footer_lines[0].replace('#', '')), 'cycle_count': safe_int(footer_lines[1].replace('#', ''))}
+    return bms_data
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0: print("[MQTT] Successfully connected to broker!"); connection_event.set()
+    else: print(f"[MQTT] Connection failed with code: {rc}.")
+
+def get_module_info(ser):
+    print("Sending 'info' command to detect module barcodes...")
+    ser.write(b'info\n'); response_bytes = ser.read_until(b'pylon_debug>')
     response_str = response_bytes.decode('ascii', errors='ignore')
-    
-    print("--- Detected Modules (Logical Order from BMS) ---")
-    current_bmu_index = -1
+    modules_map = {}; current_bmu_index = -1
     for line in response_str.splitlines():
         line = line.strip()
         if line.startswith('BMU'):
-            try:
-                current_bmu_index = int(line.split()[1])
-            except (ValueError, IndexError):
-                current_bmu_index = -1
-        
+            try: current_bmu_index = int(line.split()[1])
+            except (ValueError, IndexError): current_bmu_index = -1
         if line.startswith('Module:') and current_bmu_index != -1:
             try:
-                barcode = line.split(':', 1)[1].strip()
+                barcode = line.split(':', 1)[1].strip().replace(':','').strip()
                 if barcode:
-                    print(f"  Logical Index (BMU): {current_bmu_index} -> Barcode: {barcode}")
-            except IndexError:
-                continue
-    print("-------------------------------------------------")
+                    modules_map[current_bmu_index] = barcode
+                    print(f"  > Found mapping: Logical Index {current_bmu_index} -> Barcode: {barcode}")
+            except IndexError: continue
+    if not modules_map:
+        print("Could not detect modules via 'info' command."); return None
+    print(f"Detected {len(modules_map)} battery modules in total.")
+    return modules_map
 
-def main():
-    """Main function for diagnostics."""
-    ser = None
-    try:
-        # Nastavíme delší timeout, aby měl příkaz 'info' dostatek času
-        ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=15)
-        print(f"Serial port {SERIAL_PORT} opened successfully at {BAUDRATE} baud.")
-        
-        connect_and_authorize(ser)
-        
-        get_and_print_module_info(ser)
-        
-        print("\n--- Starting periodic cell data reading (command: getpwr) ---")
-        print("Now you can induce an anomaly (e.g., disconnect a module's balance connector).")
-        print("Watch the output to see which group of cells (1-15, 16-30, etc.) shows an error.")
-        
-        while True:
-            ser.write(CMD_GET_DATA)
-            response_bytes = ser.read_until(b'pylon_debug>')
-            raw_output = response_bytes.decode('ascii', errors='ignore')
-            
-            data_lines = [line.strip() for line in raw_output.strip().splitlines() if '#' in line]
-            
-            print(f"\n--- Data at {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-            if not data_lines:
-                print("No data received.")
-            else:
-                for i, line in enumerate(data_lines):
-                    cell_global_index = i + 1
-                    # Vypisujeme data pro každý článek, aby byla anomálie jasně vidět
-                    print(f"  Cell {cell_global_index:02d}: {line}")
-            
-            time.sleep(5)
+def publish_ha_discovery(client, modules_map):
+    print("Publishing MQTT Discovery configuration (in English)...")
+    device_info = {"identifiers": [DEVICE_UNIQUE_ID], "name": DEVICE_NAME, "manufacturer": "Pylontech"}
+    
+    summary_sensors = {"voltage": {"n": "Total Voltage", "u": "V", "c": "voltage"}, "current": {"n": "Total Current", "u": "A", "c": "current"}, "avg_temperature": {"n": "Average Temperature", "u": "°C", "c": "temperature"}, "capacity": {"n": "Capacity", "u": "Wh", "c": "energy"}, "status": {"n": "Status", "i": "mdi:information-outline"}, "voltage_status": {"n": "Voltage Status", "i": "mdi:lightning-bolt"}, "current_status": {"n": "Current Status", "i": "mdi:current-ac"}, "temperature_status": {"n": "Temperature Status", "i": "mdi:thermometer"}, "cycle_count": {"n": "Cycle Count", "i": "mdi:battery-sync", "s": "total_increasing"}, "error_code": {"n": "Error Code", "i": "mdi:alert-circle-outline"}, "module_count": {"n": "Module Count", "i": "mdi:battery"}}
+    for key, val in summary_sensors.items():
+        topic_slug = f"{DEVICE_UNIQUE_ID}_{key}"; config_payload = {"name": val['n'], "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+        if "u" in val: config_payload["unit_of_measurement"] = val["u"]
+        if "c" in val: config_payload["device_class"] = val["c"]
+        if "s" in val: config_payload["state_class"] = val["s"]
+        if "i" in val: config_payload["icon"] = val["i"]
+        client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
 
-    except KeyboardInterrupt:
-        print("\nExiting diagnostic tool.")
-    except Exception as e:
-        print(f"\nA critical error occurred: {e}")
-    finally:
-        if ser and ser.is_open:
-            ser.close()
-            print("Serial port closed.")
+    cell_sensors = {"voltage": {"n": "Voltage", "u": "V", "c": "voltage"}, "temperature": {"n": "Temperature", "u": "°C", "c": "temperature"}, "status_1": {"n": "Status 1", "i": "mdi:list-status"}, "status_2": {"n": "Status 2", "i": "mdi:list-status"}}
+    
+    CELLS_PER_MODULE = 15; total_cells = len(modules_map) * CELLS_PER_MODULE
+    print(f"Creating HA sensors for {total_cells} cells across {len(modules_map)} modules...")
+    
+    for i in range(1, total_cells + 1):
+        logical_module_index = (i - 1) // CELLS_PER_MODULE
+        cell_in_module_num = ((i - 1) % CELLS_PER_MODULE) + 1
+        barcode = modules_map.get(logical_module_index, f"Unknown_BMU_{logical_module_index}")
+        short_barcode = barcode[-4:]
 
-if __name__ == "__main__":
-    main()
+        for key, val in cell_sensors.items():
+            topic_slug = f"{DEVICE_UNIQUE_ID}_cell_{i}_{key}"
+            entity_name = f"M({short_barcode}) C{cell_in_module_num} {val['n']}"
+            config_payload = {"name": entity_name, "unique_id": topic_slug, "state_topic": f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/state", "device": device_info}
+            if "u" in val: config_payload["unit_of_measurement"] = val["u"]
+            if "c" in val: config_payload["device_class"] = val["c"]
+            if "s" in val: config_payload["state_class"] = val["s"]
+            if "i" in val: config_payload["icon"] = val["i"]
+            client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{topic_slug}/config", json.dumps(config_payload), retain=True)
+    
+    print("Configuration publishing finished.")
+
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+mqtt_client.on_connect = on_connect; mqtt_client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+try:
+    print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}..."); mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60); mqtt_client.loop_start()
+    if not connection_event.wait(timeout=10): raise ConnectionError("Timeout while waiting for MQTT broker connection.")
+    ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=15)
+    print(f"Serial port {SERIAL_PORT} opened successfully at {BAUDRATE} baud.")
+    connect_and_authorize(ser)
+    module_info = get_module_info(ser)
+    if module_info is None: raise SystemExit("Exiting due to module detection failure.")
+    publish_ha_discovery(mqtt_client, module_info)
+    mqtt_client.publish(f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_module_count/state", len(module_info))
+    
+    print("\n--- Starting regular data reading and publishing to HA ---")
+    while True:
+        ser.write(CMD_GET_DATA); response_bytes = ser.read_until(b'pylon_debug>'); raw_output = response_bytes.decode('ascii', errors='ignore')
+        data = parse_bms_data(raw_output)
+        if data and data.get('summary') and data.get('footer') and data.get('cells'):
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Data received, publishing to MQTT.")
+            all_summary_data = {**data['summary'], **data['footer']}
+            for key, value in all_summary_data.items():
+                topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_{key}/state"; mqtt_client.publish(topic, value)
+                if DEBUG_MODE: print(f"  > MQTT | Topic: {topic} | Payload: {value}")
+            for cell in data['cells']:
+                for key, value in cell.items():
+                    if key == 'id': continue
+                    topic = f"{HA_DISCOVERY_PREFIX}/sensor/{DEVICE_UNIQUE_ID}_cell_{cell['id']}_{key}/state"; mqtt_client.publish(topic, value)
+                    if DEBUG_MODE and key == 'voltage': print(f"  > MQTT | Publishing Cell {cell['id']} data...")
+        else:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Waiting for complete data...")
+        time.sleep(30)
+except Exception as e:
+    print(f"A critical error occurred: {e}")
+finally:
+    if 'ser' in locals() and ser.is_open: ser.close(); print("Serial port closed.")
+    if mqtt_client.is_connected():
+        mqtt_client.loop_stop(); mqtt_client.disconnect()
+        print("MQTT connection closed.")
